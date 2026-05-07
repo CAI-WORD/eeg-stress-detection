@@ -1,0 +1,28 @@
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc
+
+# 训练输出
+stew_logs/
+stew_models/
+test_logs*/
+test_models*/
+
+# IDE
+.idea/
+.vscode/
+
+# 环境
+.env
+venv/
+.venv/
+
+# 数据集（大文件）
+*.mat
+
+# 系统
+.DS_Store
+Thumbs.db
