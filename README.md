@@ -14,15 +14,47 @@
 
 本项目实现了一个混合 **CNN-LSTM** 深度学习架构，用于基于 EEG 信号的心理压力识别和情绪分类。主要特点：
 
-- **双任务支持**：回归（连续压力值 0~1） + 分类（情绪标签）
-- **多数据集兼容**：DEAP (32通道)、SEED (62通道)、STEW、Neurocom
+- **双任务支持**：回归（连续压力值 0~1）+ 分类（情绪标签）
+- **多数据集兼容**：DEAP (32通道)、SEED (62通道)、STEW (14通道)、Neurocom
 - **差分熵(DE)特征**：论文[2]方法，四个频段提取 (Theta/Alpha/Beta/Gamma)
 - **电极-矩形映射**：论文[2]证明可提升空间特征判别性
-- **数据增强**：高斯噪声、通道Dropout、时间掩码、GAN生成
+- **数据增强**：高斯噪声、通道Dropout、时间掩码
 - **频带能量分析**：Delta/Theta/Alpha/Beta/Gamma 五频段
 - **集成模型**：时域+频域融合预测（论文[1]）
-- **K折交叉验证**：论文[3]使用10折(DEAP)和LOSO(SEED)
+- **YAML配置驱动**：所有超参数通过 `config.yaml` 管理
 - **完整评估指标**：回归(MSE/MAE/R²/Corr) + 分类(Accuracy/Precision/Recall/F1)
+- **实时推理引擎**：支持W8脑电放大器实时采集→预处理→模型推理→压力指数
+
+---
+
+## 最新进展
+
+### 问题修复与优化（2026年5月）
+
+项目针对 STEW 数据集训练中发现的 7 个问题进行了系统性修复：
+
+| 问题 | 严重程度 | 解决方案 |
+|------|---------|---------|
+| 数据泄露（滑窗重叠导致相邻段信息共享） | P0 | overlap=0，不重叠滑窗，消除数据泄露 |
+| 类别不均衡 | P1 | WeightedRandomSampler + 权重上限(5倍中位数) |
+| 过拟合 | P2 | dropout=0.4, weight_decay=0.03, label_smoothing=0.2 |
+| 数据增强不足 | P3 | 增强噪声(std=0.05)、通道dropout(0.1)、时间掩码(size=40) |
+| 训练不稳定 | P4 | ReduceLROnPlateau + 10轮warmup |
+| 模型过大 | P5 | CNN通道[32,64,128]，LSTM隐层64 |
+| 标签缺失(0-3类) | P6 | 不重叠滑窗后，所有4-9类均有样本分配到测试集 |
+
+**最终结果（10分类）：测试准确率 64.49%**（加权平均F1 0.66）
+
+### 3分类优化（后续实验）
+
+将10类标签映射为低/中/高三档压力后：
+
+| 指标 | 值 |
+|------|----|
+| 学习率 | 0.0005（10分类的0.001→0.0005） |
+| 权重衰减 | 0.05（增强正则化） |
+| 标签平滑 | 0.05（3类不需要0.2的强平滑） |
+| 早停耐心 | 20轮 |
 
 ---
 
@@ -30,15 +62,30 @@
 
 ```
 eeg_stress_detection/
-├── model.py              # 模型定义 (CNN-LSTM, 频域, 集成, GAN)
-├── trainer.py            # 训练器, 数据集, 数据增强, 交叉验证
-├── example.py            # 使用示例和演示
-├── requirements.txt      # 依赖包列表
-├── README.md             # 项目说明
-├── logs/                 # 训练日志 (训练后生成)
-├── saved_models/         # 保存的模型 (训练后生成)
-├── demo_logs/            # 演示用日志
-└── demo_models/          # 演示用模型
+├── config.yaml              # 统一配置文件（模型/训练/增强/数据划分）
+├── model.py                 # 模型定义（CNN-LSTM, 频域, 集成, GAN）
+├── trainer.py               # 训练器, 数据集, 数据增强, 交叉验证
+├── dataset_transform.py     # 数据集加载与预处理工具
+├── train_stew.py            # STEW数据集 10分类训练脚本
+├── train_6ch_model.py       # 6通道(适配W8) 3分类训练脚本
+├── inference.py             # 实时推理引擎（W8脑电放大器→压力指数）
+├── example.py               # 使用示例和演示（原demo脚本）
+├── requirements.txt         # 依赖包列表
+├── README.md                # 项目说明
+│
+├── stew_logs/               # STEW 10分类训练日志（TensorBoard + 图表）
+│   ├── training.log
+│   ├── loss_curve.png
+│   ├── confusion_matrix.png
+│   ├── classification_report.txt
+│   └── events.out.tfevents.*
+│
+├── stew_models/             # STEW 10分类模型检查点
+│   ├── best_model.pth
+│   └── latest_checkpoint.pth
+│
+├── stew_logs_6ch/           # 6通道 3分类训练日志
+└── stew_models_6ch/         # 6通道 3分类模型检查点
 ```
 
 ---
@@ -50,25 +97,25 @@ eeg_stress_detection/
 基于三篇论文的混合架构：
 
 ```
-输入: [batch, n_channels, n_timepoints]
+输入: [batch, n_channels, n_timepoints]  (默认 14×320)
   │
   ├─ [可选] 2D电极-矩形映射 (论文[2] Fig.3)
-  │    └─ 2D-CNN 空间特征提取
+  │    └─ 2D-CNN 空间特征提取（DEAP 32ch / SEED 62ch）
   │
   ├─ 1D-CNN 空间/频率特征提取 (论文[2] 第三节C)
-  │    ├─ Conv1D(k=7) → BN → ReLU → Dropout
-  │    ├─ Conv1D(k=5) → BN → ReLU → Dropout
-  │    ├─ Conv1D(k=5) → BN → ReLU → Dropout
-  │    └─ AdaptiveMaxPool1d
+  │    ├─ Conv1D(k=7) → BN → GELU → Dropout(0.4)
+  │    ├─ Conv1D(k=5) → BN → GELU → Dropout(0.4)
+  │    ├─ Conv1D(k=5) → BN → GELU → Dropout(0.4)
+  │    └─ AdaptiveMaxPool1d (降采样至 n_timepoints//4)
   │
   ├─ 注意力机制
   │    ├─ 通道注意力 (ChannelAttention)
   │    └─ 空间注意力 (SpatialAttention)
   │
   ├─ Bi-LSTM 时序建模 (论文[2] 第三节D)
-  │    └─ 2层 LSTM, hidden=128, bidirectional
+  │    └─ 2层 LSTM, hidden=64, bidirectional
   │
-  ├─ 多头自注意力 (MultiheadAttention)
+  ├─ 多头自注意力 (MultiheadAttention, heads=4)
   │
   └─ 输出头
        ├─ 回归: Linear → Sigmoid → [0,1] 压力值 (论文[1])
@@ -76,18 +123,14 @@ eeg_stress_detection/
 ```
 
 ### FrequencyDomainEEGModel
-
 频域特征专用模型，接收各频段特征向量。
 
 ### EnsembleEEGModel
-
 时域+频域融合模型（论文[1]），通过融合层合并两个子模型的预测。
 
 ### GAN数据增强 (论文[3] 第三节)
-
 - **生成器**: 全连接网络，从噪声生成合成EEG信号
 - **判别器**: 卷积网络，区分真实/合成信号
-- 可提升 2~3% 准确率
 
 ---
 
@@ -106,61 +149,155 @@ eeg_env\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
-### 运行演示
+### STEW 10分类训练
 
 ```bash
-# 完整演示 (模型创建 + DE特征 + 分类 + 集成 + 交叉验证)
-python example.py
+# 使用默认配置
+python train_stew.py
+
+# 使用自定义配置
+python train_stew.py --config my_config.yaml
 ```
 
-### 训练模型
+### 6通道(W8适配) 3分类训练
 
-```python
-from model import EEGStressCNNLSTM
-from trainer import EEGStressTrainer, EEGStressDataset, EEGDataAugmentation
-from torch.utils.data import DataLoader
-
-# 创建回归模型 (压力值预测)
-model = EEGStressCNNLSTM(
-    n_channels=32,
-    n_timepoints=1280,
-    task_type="regression",
-)
-
-# 数据加载
-train_dataset = EEGStressDataset(
-    eeg_data, labels,
-    task_type="regression",
-    transform=EEGDataAugmentation(noise_std=0.01),
-)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-
-# 训练
-trainer = EEGStressTrainer(
-    model=model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    test_loader=test_loader,
-    task_type="regression",
-)
-trainer.train()
+```bash
+python train_6ch_model.py
 ```
 
-### 情绪分类 (论文[2])
+### 实时推理
 
 ```python
-model = EEGStressCNNLSTM(
-    n_channels=32,
-    n_timepoints=1280,
-    task_type="classification",
-    num_classes=2,        # 二分类: 高/低 valence 或 arousal
-    use_2d_mapping=True,  # 使用电极-矩形映射
-)
+from inference import StressInferenceEngine
+
+# 加载训练好的6通道模型
+engine = StressInferenceEngine(model_path="./stew_models_6ch/best_model.pth")
+
+# 逐帧输入W8原始数据 (8通道, 500Hz)
+for frame_8ch in w8_device_stream():
+    result = engine.feed_frame(frame_8ch)  # 自动重参考→降采样→滤波→推理
+    if result:
+        print(f"压力指数: {result['stress_level']} (0-9)")
+        print(f"概率分布: {result['probabilities']}")
+```
+
+### 离线推理测试
+
+```python
+from inference import StressInferenceEngine
+import numpy as np
+
+engine = StressInferenceEngine(model_path=None)  # 随机权重
+
+# 模拟W8数据 (8通道, 500Hz, 5秒)
+t = np.arange(0, 5, 1/500)
+raw_data = np.random.randn(len(t), 8) * 2.0
+
+# 逐帧输入
+for frame in raw_data:
+    result = engine.feed_frame(frame)
+    if result:
+        print(f"压力等级: {result['stress_level']}")
+```
+
+### 数据加载与预处理
+
+```python
+from dataset_transform import load_stew_format, segment_eeg, preprocess_eeg
+
+# 加载STEW数据
+eeg, labels = load_stew_format("./data")  # (45, 14, 19200)
+
+# 预处理：z-score归一化 + 0.5-45Hz带通滤波
+eeg = preprocess_eeg(eeg, normalize="zscore", bandpass_low=0.5, bandpass_high=45, fs=128)
+
+# 滑窗分段：2.5秒窗口，不重叠
+segs, seg_labels = segment_eeg(eeg, labels, window_sec=2.5, fs=128, overlap=0.0)
+# 输出: (2700, 14, 320)
 ```
 
 ---
 
+## 配置系统
+
+所有训练和模型参数通过 `config.yaml` 管理，包含详细注释说明每个参数的影响。
+
+### 关键配置项
+
+| 模块 | 参数 | 默认值 | 说明 |
+|------|------|--------|------|
+| 任务 | `num_classes` | 10 | 分类数（10类/3类/2类） |
+| 预处理 | `window_sec` | 2.5 | 滑窗长度(秒) |
+| | `overlap` | 0.0 | 滑窗重叠率（0=不重叠） |
+| | `normalize` | zscore | 归一化方式 |
+| | `bandpass_low` | 0.5 | 高通截止(Hz) |
+| | `bandpass_high` | 45 | 低通截止(Hz) |
+| 模型 | `cnn_channels` | [32,64,128] | CNN各层输出通道 |
+| | `lstm_hidden` | 64 | LSTM隐层大小 |
+| | `lstm_layers` | 2 | LSTM层数 |
+| | `dropout_rate` | 0.4 | Dropout比率 |
+| | `activation` | gelu | 激活函数 |
+| 训练 | `epochs` | 50 | 最大训练轮数 |
+| | `batch_size` | 64 | 批次大小 |
+| | `learning_rate` | 0.001 | 初始学习率 |
+| | `weight_decay` | 0.03 | 权重衰减 |
+| | `lr_scheduler` | plateau | 学习率调度策略 |
+| | `label_smoothing` | 0.2 | 标签平滑系数 |
+| 增强 | `noise_std` | 0.05 | 高斯噪声标准差 |
+| | `channel_dropout_prob` | 0.1 | 通道随机丢弃概率 |
+| | `time_mask_prob` | 0.1 | 时间掩码概率 |
+| | `time_mask_size` | 40 | 时间掩码长度 |
+
+---
+
+## 实时推理引擎 (`inference.py`)
+
+专为 **W8 脑电放大器** 设计的实时推理引擎，数据流程：
+
+```
+W8 (500Hz, 8通道)
+  → 重参考: (TP9 + TP10) / 2
+  → 6信号通道: [FCz, Pz, POz, O1, Oz, O2]
+  → 降采样: 500Hz → 125Hz
+  → 带通滤波: 0.5-45Hz (Butterworth 4阶)
+  → 通道映射: W8通道 → 模型输入顺序
+  → z-score归一化
+  → 2.5秒滑窗 (312点 @125Hz)
+  → CNN-LSTM推理 → 压力指数 (0-9)
+  → 3帧平滑输出
+```
+
+关键特性：
+
+- **逐帧处理**：每帧8通道原始数据输入，自动累积到窗口长度后推理
+- **推理节流**：默认0.5秒间隔，避免频繁推理
+- **输出平滑**：最近3次推理结果取平均，防止突变
+- **滑动缓冲区**：deque存储原始数据，自动管理窗口边界
+
+---
+
 ## 数据集支持
+
+### STEW (主数据集)
+
+| 属性 | 值 |
+|------|-----|
+| 通道数 | 14 EEG (Emotiv EPOC) |
+| 采样率 | 128 Hz |
+| 被试 | 45人 × 150秒 Stroop任务 |
+| 标签 | 0-9 十级压力评分 |
+| 实际有效类 | 4-9（6类，0-3类无被试数据） |
+| 预滑动窗后样本量 | 2700段 (2.5s, 不重叠) |
+
+标签映射（3分类方案）：
+```
+原始0-9 → 低压力(0-3→0) / 中压力(4-6→1) / 高压力(7-9→2)
+```
+
+6通道选择（适配W8脑电放大器）：
+```
+FC5(3), P7(5), O1(6), O2(7), P8(8), FC6(10)
+```
 
 ### DEAP (论文[2][3])
 
@@ -170,8 +307,6 @@ model = EEGStressCNNLSTM(
 | 采样率 | 128 Hz |
 | 实验 | 32人 × 40视频 (60秒) |
 | 标签 | Valence, Arousal, Dominance, Liking (1~9) |
-| 预处理 | 降采样至128Hz, 4~45Hz带通滤波 |
-| 分段 | 3秒窗口, 50%重叠 (论文[3]) |
 
 ### SEED (论文[3])
 
@@ -179,20 +314,21 @@ model = EEGStressCNNLSTM(
 |------|-----|
 | 通道数 | 62 EEG |
 | 采样率 | 200 Hz (原始1000Hz降采样) |
-| 实验 | 15人 × 15视频 (约4分钟) |
 | 标签 | Positive / Neutral / Negative |
-| 分段 | 4秒窗口, 1秒重叠 |
 
 ### 加载示例
 
 ```python
-from trainer import load_deap_format, load_seed_format
+from dataset_transform import load_stew_format, load_deap_format, load_seed_format
+
+# STEW
+data, labels = load_stew_format("./data")  # 返回 .mat 文件
 
 # DEAP
-data, labels = load_deap_format("./data/deap/data_preprocessed_matlab/s01.mat")
+data, labels = load_deap_format("./data/deap/s01.mat")  # 返回 .dat 文件
 
 # SEED
-data, labels = load_seed_format("./data/seed/Preprocessed_EEG/1_20131027.mat")
+data, labels = load_seed_format("./data/seed/1_20131027.mat")  # 返回 .mat/.h5
 ```
 
 ---
@@ -213,13 +349,13 @@ DE(x) = ½ · log(2πeσ²)
 from model import compute_differential_entropy, extract_band_de_features
 
 de = compute_differential_entropy(eeg_signal)             # [B, C]
-band_de = extract_band_de_features(eeg_signal, fs=128)     # [B, C, 4]
+band_de = extract_band_de_features(eeg_signal, fs=128)    # [B, C, 4]
 ```
 
 ### 频带能量
 
 ```python
-from trainer import extract_freq_band_power
+from dataset_transform import extract_freq_band_power
 
 band_power = extract_freq_band_power(eeg_data, fs=128)
 # 返回: [B, C, 5] — Delta, Theta, Alpha, Beta, Gamma
@@ -229,55 +365,29 @@ band_power = extract_freq_band_power(eeg_data, fs=128)
 
 ## 评估指标
 
+### 分类任务（STEW 10分类）
+
+| 类别 | 原始标签 | 精确率 | 召回率 | F1 | 样本数 |
+|------|---------|--------|--------|-----|-------|
+| 4 | 低压力 | 0.32 | 0.87 | 0.47 | 54 |
+| 5 | 中压力 | 0.83 | 0.59 | 0.69 | 180 |
+| 6 | 中压力 | 0.56 | 0.77 | 0.65 | 126 |
+| 7 | 高压力 | 0.75 | 0.57 | 0.65 | 198 |
+| 8 | 高压力 | 0.77 | 0.60 | 0.67 | 199 |
+| 9 | 高压力 | 0.71 | 0.78 | 0.74 | 54 |
+
+**加权平均 F1: 0.66  |  准确率: 64.49%**（overlap=0, 无数据泄露）
+
 ### 回归任务
 
-| 指标 | 含义 | 论文[1]结果 |
-|------|------|-------------|
-| MSE | 均方误差 ↓ | < 0.02 |
-| MAE | 平均绝对误差 ↓ | < 0.1 |
-| R² | 决定系数 ↑ | > 0.85 |
-| Correlation | 相关系数 ↑ | > 0.9 |
+| 指标 | 含义 |
+|------|------|
+| MSE | 均方误差 ↓ |
+| MAE | 平均绝对误差 ↓ |
+| R² | 决定系数 ↑ |
+| Correlation | 相关系数 ↑ |
 
-### 分类任务
-
-| 指标 | 论文[2] DEAP | 论文[3] DEAP | 论文[3] SEED |
-|------|--------------|--------------|--------------|
-| Valence | 95.82% | 93.4% | — |
-| Arousal | 95.96% | 91.2% | — |
-| 平均 | — | 92.3% | 89.8% |
-
----
-
-## 超参数配置
-
-```python
-# 模型参数
-config = {
-    "n_channels": 32,              # EEG通道数
-    "n_timepoints": 1280,          # 时间点数
-    "cnn_channels": [64, 128, 256],# CNN通道数
-    "lstm_hidden": 128,            # LSTM隐藏层
-    "lstm_layers": 2,              # LSTM层数
-    "dropout_rate": 0.3,           # Dropout (论文[3]: 0.3~0.5)
-    "task_type": "regression",     # 任务类型
-    "use_2d_mapping": False,       # 电极映射 (论文[2])
-}
-
-# 训练参数 (论文[3])
-training_config = {
-    "learning_rate": 0.001,        # Adam优化器
-    "batch_size": 64,              # 批次大小
-    "epochs": 100,                 # 训练轮数
-    "patience": 15,                # 早停耐心
-    "weight_decay": 1e-2,          # 权重衰减
-    "gradient_clip": 1.0,          # 梯度裁剪
-    "lr_scheduler": "cosine",      # 学习率调度
-}
-```
-
----
-
-## 方法对比
+### 论文基准
 
 | 模型 | DEAP Valence | DEAP Arousal | STEW | Neurocom |
 |------|-------------|--------------|------|----------|
@@ -285,7 +395,29 @@ training_config = {
 | CNN | 90.1% | 88.5% | — | — |
 | LSTM | 88.4% | 86.2% | — | — |
 | PCRNN | 90.26% | 90.98% | — | — |
-| **本模型** | **95.82%** | **95.96%** | **100%** | **97%** |
+| 论文[2]模型 | **95.82%** | **95.96%** | — | — |
+| 论文[1]模型 | — | — | **100%** | **97%** |
+
+---
+
+## 训练日志与可视化
+
+每次训练自动生成：
+
+- **TensorBoard日志**：`stew_logs/events.out.tfevents.*`，可用 `tensorboard --logdir stew_logs` 查看
+- **训练曲线**：`stew_logs/loss_curve.png`（损失和准确率变化）
+- **混淆矩阵**：`stew_logs/confusion_matrix.png`
+- **分类报告**：`stew_logs/classification_report.txt`
+- **训练日志**：`stew_logs/training.log`（每轮详细指标）
+
+### Visdom 实时可视化
+
+```bash
+# 启动 Visdom 服务
+python -m visdom.server -port 707
+
+# 训练时自动连接 (config.yaml 中 visdom.enabled=true)
+```
 
 ---
 

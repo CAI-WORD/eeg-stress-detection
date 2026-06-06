@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-STEW数据集 — 10分类训练脚本
+6通道EEG压力分类模型训练脚本
+2
+基于 STEW 数据集，选取6个与W8放大器最匹配的通道：
+  FC5, P7, O1, O2, P8, FC6
 
 用法:
-  python train_stew.py                         # 使用默认 config.yaml
-  python train_stew.py --config my_config.yaml  # 使用自定义配置
+  python train_6ch_model.py
+  python train_6ch_model.py --config my_config.yaml
 """
 
 import yaml
@@ -19,19 +22,38 @@ from trainer import EEGStressDataset, EEGStressTrainer, EEGDataAugmentation
 from dataset_transform import load_stew_format, segment_eeg, preprocess_eeg
 
 
+# STEW 14通道 → 选中的6通道索引
+# Emotiv EPOC 14通道顺序: AF3,F7,F3,FC5,T7,P7,O1,O2,P8,T8,FC6,F4,F8,AF4
+SELECTED_CHANNEL_INDICES = [3, 5, 6, 7, 8, 10]  # FC5, P7, O1, O2, P8, FC6
+CHANNEL_NAMES = ["FC5", "P7", "O1", "O2", "P8", "FC6"]
+
+# STEW 0-9 十级评分 → 3分类映射
+#   低压力: 0-3 → 0
+#   中压力: 4-6 → 1
+#   高压力: 7-9 → 2
+STEW_TO_3CLASS = {
+    0: 0, 1: 0, 2: 0, 3: 0,
+    4: 1, 5: 1, 6: 1,
+    7: 2, 8: 2, 9: 2,
+}
+
+
+def map_labels_to_3class(labels):
+    """将STEW 0-9标签映射为3分类标签"""
+    return np.array([STEW_TO_3CLASS[l] for l in labels], dtype=np.int64)
+
+
 def load_config(config_path="config.yaml"):
-    """加载 YAML 配置文件"""
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     return cfg
 
 
 def main():
-    parser = argparse.ArgumentParser(description="STEW 10分类训练")
+    parser = argparse.ArgumentParser(description="6通道EEG压力分类训练")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     args = parser.parse_args()
 
-    # ─── 加载配置 ────────────────────────────────────────────────────────────────
     cfg = load_config(args.config)
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]
@@ -41,20 +63,22 @@ def main():
     paths_cfg = cfg["paths"]
 
     print("=" * 60)
-    print(f"{cfg['dataset']['name']} 数据集 {cfg['task_type']} 训练")
+    print(f"{cfg['dataset']['name']} 数据集 6通道训练")
+    print(f"选中的通道: {CHANNEL_NAMES}")
     print(f"分类数: {cfg['num_classes']}")
-    print(f"模型: CNN-LSTM, {model_cfg['cnn_channels']} → LSTM({model_cfg['lstm_hidden']})")
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"设备: {device_name} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else '无GPU'})")
-    print(f"Epochs: {train_cfg['epochs']}, Batch: {train_cfg['batch_size']}, LR: {train_cfg['learning_rate']}")
+    print(f"设备: {device_name}")
     print("=" * 60)
 
-    # ─── 1. 加载数据 ──────────────────────────────────────────────────────────────
+    # ─── 1. 加载数据 ──────────────────────────────────────────
     eeg, labels = load_stew_format(dataset_cfg["data_dir"])
     print(f"\n原始数据: {eeg.shape}")
-    print(f"标签分布(0-9): {np.bincount(labels)}")
 
-    # ─── 2. 预处理 ────────────────────────────────────────────────────────────────
+    # ─── 2. 选择6通道 ──────────────────────────────────────────
+    eeg = eeg[:, SELECTED_CHANNEL_INDICES, :]
+    print(f"6通道选择后: {eeg.shape}  {CHANNEL_NAMES}")
+
+    # ─── 3. 预处理 ─────────────────────────────────────────────
     preproc = cfg.get("preprocessing", {})
     eeg = preprocess_eeg(
         eeg,
@@ -63,19 +87,18 @@ def main():
         bandpass_high=preproc.get("bandpass_high"),
         fs=preproc.get("fs", dataset_cfg.get("fs", 128)),
     )
-    print(f"预处理后: {eeg.shape}")
 
-    # ─── 3. 不重叠滑窗（overlap=0，相邻段无数据共享） ────────────────────
+    # ─── 4. 滑窗分段 ───────────────────────────────────────────
     segs, seg_labels = segment_eeg(
         eeg, labels,
-        window_sec=preproc.get("window_sec", dataset_cfg.get("window_sec", 2.5)),
+        window_sec=preproc.get("window_sec", 2.5),
         fs=preproc.get("fs", dataset_cfg.get("fs", 128)),
-        overlap=preproc.get("overlap", dataset_cfg.get("overlap", 0.0)),
+        overlap=preproc.get("overlap", 0.0),
     )
     print(f"\n分段后: {segs.shape}")
     print(f"标签分布: {np.bincount(seg_labels)}")
 
-    # ─── 4. 打乱后随机划分 train/val/test ─────────────────────────────────
+    # ─── 5. 划分 train/val/test ────────────────────────────────
     val_test_ratio = 1 - split_cfg["train_ratio"]
     val_ratio_in_val_test = split_cfg["val_ratio"] / (split_cfg["val_ratio"] + split_cfg["test_ratio"])
 
@@ -89,9 +112,8 @@ def main():
     )
     print(f"\n划分: 训练 {X_tr.shape[0]} | 验证 {X_val.shape[0]} | 测试 {X_te.shape[0]}")
 
-    # ─── 5. WeightedRandomSampler（缓解类别不平衡, P1） ─────────────────────
-    WEIGHT_CAP_MULTIPLIER = 5  # 权重上限倍数：防止少数类被极端过度采样
-
+    # ─── 6. WeightedRandomSampler ───────────────────────────────
+    WEIGHT_CAP_MULTIPLIER = 5
     class_counts = np.bincount(y_tr, minlength=cfg["num_classes"])
     raw_weights = 1.0 / (class_counts + 1e-8)
     median_weight = np.median(raw_weights[class_counts > 0])
@@ -103,7 +125,7 @@ def main():
         replacement=True,
     )
 
-    # ─── 6. DataLoader ────────────────────────────────────────────────────────────
+    # ─── 7. DataLoader ──────────────────────────────────────────
     tr_ds = EEGStressDataset(
         X_tr, y_tr, task_type=cfg["task_type"],
         transform=EEGDataAugmentation(
@@ -120,9 +142,9 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"], shuffle=False)
     te_loader = DataLoader(te_ds, batch_size=train_cfg["batch_size"], shuffle=False)
 
-    # ─── 7. 模型 ──────────────────────────────────────────────────────────────────
+    # ─── 8. 创建6通道模型 ──────────────────────────────────────
     model = EEGStressCNNLSTM(
-        n_channels=model_cfg["n_channels"],
+        n_channels=6,  # 6 通道！
         n_timepoints=model_cfg["n_timepoints"],
         cnn_channels=model_cfg["cnn_channels"],
         cnn_kernel_sizes=model_cfg.get("cnn_kernel_sizes", (7, 5, 5)),
@@ -135,11 +157,14 @@ def main():
         activation=model_cfg.get("activation", "relu"),
         task_type=cfg["task_type"],
         num_classes=cfg["num_classes"],
-        use_2d_mapping=model_cfg["use_2d_mapping"],
+        use_2d_mapping=False,
     )
     print(f"\n模型参数: {sum(p.numel() for p in model.parameters()):,}")
 
-    # ─── 8. 训练 ──────────────────────────────────────────────────────────────────
+    # ─── 9. 训练（保存目录改为 6ch） ───────────────────────────
+    log_dir = paths_cfg["log_dir"].rstrip("/\\") + "_6ch"
+    model_save_dir = paths_cfg["model_save_dir"].rstrip("/\\") + "_6ch"
+
     vis_cfg = cfg.get("visdom", {})
     trainer = EEGStressTrainer(
         model=model,
@@ -160,9 +185,8 @@ def main():
             "seed": train_cfg.get("seed", 42),
             "patience": train_cfg["patience"],
             "min_delta": train_cfg["min_delta"],
-            "log_dir": paths_cfg["log_dir"],
-            "model_save_dir": paths_cfg["model_save_dir"],
-            # Visdom
+            "log_dir": log_dir,
+            "model_save_dir": model_save_dir,
             "visdom_enabled": vis_cfg.get("enabled", False),
             "visdom_server": vis_cfg.get("server", "http://localhost"),
             "visdom_port": vis_cfg.get("port", 707),
@@ -171,7 +195,8 @@ def main():
         task_type=cfg["task_type"],
     )
     trainer.train()
-    print("\n训练完成!")
+    print("\n6通道模型训练完成!")
+    print(f"模型保存路径: {model_save_dir}/best_model.pth")
 
 
 if __name__ == "__main__":

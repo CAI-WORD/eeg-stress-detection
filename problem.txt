@@ -1,0 +1,143 @@
+# EEG Stress Detection — 模型问题诊断报告
+
+## 当前性能
+
+| 指标 | 值 |
+|------|------|
+| Test Accuracy | 81.89% |
+| Best Val Loss | 0.8408 (epoch 44) |
+| Final Train Loss | 0.697 |
+| Final Val Loss | 0.868 |
+| 测试集类别覆盖 | 仅 6/10 类 (4-9) |
+
+### 分类报告
+
+```
+Class 4:  P=0.764  R=1.000  F1=0.866  (support=107)
+Class 5:  P=0.852  R=0.857  F1=0.855  (support=357)
+Class 6:  P=0.831  R=0.808  F1=0.820  (support=250)
+Class 7:  P=0.904  R=0.746  F1=0.817  (support=393)
+Class 8:  P=0.894  R=0.768  F1=0.826  (support=393)
+Class 9:  P=0.522  R=0.991  F1=0.684  (support=107)
+```
+
+---
+
+## 问题 1（最关键）：数据泄露 — 先滑窗后切分
+
+**位置**: `train_stew.py:94-101`
+
+```python
+# ❌ 当前错误做法：滑窗生成所有segments后再划分
+segs, seg_labels = segment_eeg(eeg, labels, ...)   # 先滑窗
+X_tr, X_te, y_tr, y_te = train_test_split(segs, seg_labels, ...)  # 再切分
+```
+
+**后果**:
+- 同一被试的相邻滑窗段（50%重叠，信号高度相似）可能同时进入train和val
+- val_loss虚低，模型真实泛化能力被高估
+- 当前81.89%的test accuracy可能包含数据泄露带来的水分
+
+**修复方案**: 先按subject划分，再分别做滑窗。
+
+---
+
+## 问题 2：类别不平衡严重
+
+**现象**:
+- 类别0-3在测试集中完全未出现（support=0）
+- Class 4 和 Class 9 support仅107（相比7/8的393）
+- Class 9 precision=0.522—模型严重偏向预测为9
+- Class 4 recall=1.000—模型过度预测4
+
+**原因**: STEW数据集45个subject，标签0-9分布极不均匀。当前 `class_weight: "balanced"` 和 `label_smoothing: 0.1` 不足以解决问题。
+
+**修复方案**:
+- 使用 `WeightedRandomSampler` 在batch层面平衡采样
+- 增大 `label_smoothing` 到 0.2
+- 考虑对少数类做过采样
+
+---
+
+## 问题 3：过拟合
+
+**证据**:
+- Epoch 50: train_loss=0.697, val_loss=0.868（差距0.17）
+- Epoch 44后val_loss持续上升，train_loss持续下降
+- 训练过程中val_loss剧烈波动（如epoch 3: val=2.20, epoch 4: val=3.15）
+
+**原因**:
+- 模型参数过多：CNN [64,128,256] 对14通道信号偏大
+- Dropout不足：0.3
+- 数据增强太弱：noise_std=0.01几乎无影响
+
+**修复方案**:
+- 精简模型：CNN [32,64,128], LSTM hidden=64
+- 增大dropout到0.5
+- 增强数据增强：noise_std=0.05, channel_dropout=0.1
+- 增大weight_decay到0.05
+
+---
+
+## 问题 4：数据增强太弱
+
+**位置**: `config.yaml`
+
+| 参数 | 当前值 | 建议值 | 原因 |
+|------|--------|--------|------|
+| noise_std | 0.01 | 0.05 | EEG信号幅度大，0.01几乎无效 |
+| channel_dropout_prob | 0.05 | 0.1 | 概率太低，模型不会学习鲁棒性 |
+| time_mask_prob | 0.05 | 0.1 | 同上 |
+| time_mask_size | 20 | 40 | 320点中掩码20点影响太小 |
+
+---
+
+## 问题 5：训练不稳定
+
+**证据**: val_loss在epoch 3-8间剧烈波动（2.20-3.15-2.19-1.78-2.00）
+
+**原因**:
+- CosineAnnealingLR + warmup=5，在warmup结束后LR快速下降可能导致不稳定
+- 类别不平衡加剧了训练初期的震荡
+
+**修复方案**:
+- 改用 `ReduceLROnPlateau` 调度器，根据val_loss自适应调整LR
+- 或增加warmup_epochs到10
+
+---
+
+## 问题 6：模型架构可能过参数化
+
+**位置**: `config.yaml`
+
+| 参数 | 当前值 | 建议值 | 理由 |
+|------|--------|--------|------|
+| cnn_channels | [64,128,256] | [32,64,128] | 14通道输入不需要256通道 |
+| lstm_hidden | 128 | 64 | 256维LSTM输出对320时间点过多 |
+| activation | relu | gelu | GELU更平滑，训练更稳定 |
+| dropout_rate | 0.3 | 0.5 | 增大正则化对抗过拟合 |
+
+---
+
+## 问题 7：类别0-3完全缺失
+
+测试集中完全没有类别0-3的样本，说明：
+- 要么这些类别的样本总数极少（<5个subject）
+- 要么 stratified split 在样本极少时失效
+
+**影响**: 模型无法泛化到未见过的类别，实际部署时遇到0-3类会表现不可预测。
+
+---
+
+## 修复优先级
+
+| 优先级 | 问题 | 预期提升 | 难度 |
+|--------|------|----------|------|
+| P0 | 数据泄露修复 | 获得真实的评估指标 | 低 |
+| P1 | 类别平衡 + WeightedSampler | +3~5% accuracy | 低 |
+| P2 | 增强数据增强 | +1~3% accuracy | 低 |
+| P3 | 精简模型 + 增大Dropout | 减少过拟合 | 低 |
+| P4 | 改用Plateau调度器 | 训练更稳定 | 低 |
+| P5 | 激活函数 GELU | +1~2% accuracy | 低 |
+
+> 注：修复数据泄露后，测试指标可能先下降（当前81.89%可能含水分），真实基线可能在75-78%左右。后续优化应在真实基线基础上评估。

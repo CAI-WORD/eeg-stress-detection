@@ -7,6 +7,7 @@ __pycache__/
 
 # 训练输出
 stew_logs/
+stew_logs_6ch/
 stew_models/
 test_logs*/
 test_models*/

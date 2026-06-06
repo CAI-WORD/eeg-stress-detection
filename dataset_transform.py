@@ -24,14 +24,14 @@ def load_stew_format(data_dir):
 
     文件结构:
       dataset.mat:          (14, 19200, 45)  通道×时间点×被试
-      rating.mat:           (45, 1)          0-9十级评分
+        :           (45, 1)          0-9十级评分
       class_012.mat:        (45, 1)          三分类 (0/1/2)
 
     Args:
         data_dir: 包含 .mat 文件的目录路径
 
     Returns:
-        eeg_data:  (45, 14, 19200)  float32
+        eeg_data:  (45, 14, 19200)  float32 
         labels:    (45,)             int64  0-9
     """
     import os
